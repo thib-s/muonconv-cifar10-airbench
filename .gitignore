@@ -6,3 +6,5 @@ upload.sh
 trash/
 logs/
 
+.venv/
+wandb/

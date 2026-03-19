@@ -11,6 +11,7 @@ Descends from https://github.com/tysam-code/hlb-CIFAR10/blob/main/main.py
 
 import os
 import sys
+from datetime import datetime, timezone
 
 with open(sys.argv[0]) as f:
     code = f.read()
@@ -23,6 +24,7 @@ from torch import nn
 import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as T
+import wandb
 
 torch.backends.cudnn.benchmark = True
 
@@ -192,76 +194,6 @@ def orthogonalize_kernel_beta(
         ker = (1.0 + beta) * damp * ker - beta * damp * kkk
 
     return ker  # [:co, :ci, :, :]
-
-
-# def orthogonalize_kernel_beta(
-#     ker: torch.Tensor,
-#     beta_init: float = 0.5,
-#     beta_end: float = 0.5,
-#     num_iters: int = 10,
-#     damp = 0.99,
-#     epsilon: float = 0.01,
-#     padding: int = 1,
-# ) -> torch.Tensor:
-#     """
-#     Orthogonalizes a conv2d kernel with a bjorck-based update, and inlines an AOL
-#     1-Lipschitz (L2) per-input-channel rescale.
-
-#     Args:
-#         ker: conv2d kernel [outC, inC, kh, kw]
-#         beta_init: starting beta value
-#         beta_end: ending beta value
-#         num_iters: number of iterations
-#         damp: damping factor
-#         epsilon: small positive constant for AOL rescale stability
-#         padding: number of pixels to zero-pad the kernel before the loop
-
-#     Returns:
-#         torch.Tensor with same shape as `ker` (original shape)
-#     """
-#     assert ker.ndim == 4, "ker must be [outC, inC, kh, kw]"
-#     co, ci, kh, kw = ker.shape
-
-#     # ---- Delattra per-input-channel rescale ----
-#     ker = ker / (compute_spectral_rescaling_conv(ker, n_iter=2).max() + epsilon)
-
-#     # ---- Padding ----
-#     if padding > 0:
-#         ker = F.pad(ker, (padding, padding, padding, padding))
-
-#     ker_o = ker.clone()
-
-#     # Update shapes for Bjork logic
-#     _, _, current_kh, current_kw = ker.shape
-#     ph, pw = current_kh - 1, current_kw - 1
-
-#     betas = torch.linspace(
-#         beta_init, beta_end, steps=max(1, num_iters),
-#         dtype=ker.dtype, device=ker.device
-#     )
-
-#     for beta in betas:
-#         kk = F.conv2d(ker, ker, padding=(ph, pw))
-#         kkk = F.conv_transpose2d(kk, ker, padding=(ph, pw))
-
-#         # Bjork update
-#         ker = (1.0 + beta) * ker - beta * kkk
-
-#         # Divide padded values by 2 if padding was applied
-#         if padding > 0:
-#             # mask out the central part to identify padding
-#             mask = torch.ones_like(ker)
-#             mask[:, :, padding:-padding, padding:-padding] = 0
-#             ker = ker * (1.0 - mask * 0.5)
-
-#         ker = damp * ker + (1- damp) * ker_o
-
-#     # ---- Crop back to original size ----
-#     if padding > 0:
-#         ker = ker[:, :, padding:-padding, padding:-padding]
-
-#     return ker
-
 
 @torch.compile
 def newton_schulz(
@@ -732,29 +664,39 @@ DEFAULT_OPTIMIZER_CONFIG = {
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train CIFAR10 Airbench with optional W&B sweep-configurable optimizer hyperparameters."
+        description="Train CIFAR10 Airbench with W&B logging and sweep-configurable optimizer hyperparameters."
     )
     parser.add_argument(
-        "--num-runs", type=int, default=10, help="Number of measured runs after warmup."
+        "--num-runs", type=int, default=5, help="Number of measured runs after warmup."
     )
     parser.add_argument(
         "--batch-size", type=int, default=2000, help="Training batch size."
     )
     parser.add_argument(
-        "--wandb", action="store_true", help="Enable Weights & Biases logging."
-    )
-    parser.add_argument(
-        "--wandb-project", type=str, default=None, help="W&B project name."
-    )
-    parser.add_argument(
-        "--wandb-entity", type=str, default=None, help="W&B entity/team."
-    )
-    parser.add_argument("--wandb-name", type=str, default=None, help="W&B run name.")
-    parser.add_argument(
-        "--wandb-mode",
+        "--run-name",
         type=str,
-        default=None,
-        help="W&B mode, e.g. online/offline/disabled.",
+        required=True,
+        help="W&B run name.",
+    )
+    parser.add_argument(
+        "--epochs", type=float, default=8, help="Total number of training epochs."
+    )
+    parser.add_argument(
+        "--whitening-epochs",
+        type=float,
+        default=3,
+        help="Number of epochs during which whitening bias is trained.",
+    )
+    parser.add_argument(
+        "--aug-translate",
+        type=int,
+        default=2,
+        help="Random translation padding used for training augmentation.",
+    )
+    parser.add_argument(
+        "--no-aug-flip",
+        action="store_true",
+        help="Disable training-time horizontal flip augmentation.",
     )
     parser.add_argument(
         "--bias-lr",
@@ -853,7 +795,61 @@ def build_optimizer_config(args, wandb_run):
     return optimizer_config
 
 
-def main(run, model, optimizer_config, batch_size=2000, wandb_run=None):
+def append_experiment_logbook(
+    path,
+    run_name,
+    num_runs,
+    batch_size,
+    epochs,
+    whitening_epochs,
+    aug_flip,
+    aug_translate,
+    train_acc_mean,
+    val_acc_mean,
+    train_loss_mean,
+    accs_mean,
+    accs_std,
+    optimizer_config,
+    log_path,
+):
+    timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    lines = [
+        f"## {timestamp} - {run_name}",
+        f"- mean_tta_val_acc: {accs_mean:.4f}",
+        f"- std_tta_val_acc: {accs_std:.4f}",
+        f"- mean_val_acc: {val_acc_mean:.4f}",
+        f"- mean_train_acc: {train_acc_mean:.4f}",
+        f"- mean_train_loss: {train_loss_mean:.4f}",
+        f"- num_runs: {num_runs}",
+        f"- batch_size: {batch_size}",
+        f"- epochs: {epochs}",
+        f"- whitening_epochs: {whitening_epochs}",
+        f"- aug_flip: {aug_flip}",
+        f"- aug_translate: {aug_translate}",
+        f"- log_path: {os.path.abspath(log_path)}",
+        "",
+        "### Optimizer Config",
+        "```python",
+        repr(optimizer_config),
+        "```",
+        "",
+    ]
+    with open(path, "a", encoding="utf-8") as f:
+        if f.tell() > 0:
+            f.write("\n")
+        f.write("\n".join(lines))
+
+
+def main(
+    run,
+    model,
+    optimizer_config,
+    batch_size=2000,
+    epochs=6,
+    whitening_epochs=3,
+    train_aug=None,
+    wandb_run=None,
+):
 
     is_warmup = run == "warmup"
     bias_lr = optimizer_config["bias_lr"]
@@ -862,15 +858,15 @@ def main(run, model, optimizer_config, batch_size=2000, wandb_run=None):
 
     test_loader = CifarLoader("cifar10", train=False, batch_size=2000)
     train_loader = CifarLoader(
-        "cifar10", train=True, batch_size=batch_size, aug=dict(flip=True, translate=2)
+        "cifar10", train=True, batch_size=batch_size, aug=train_aug
     )
     if run == "warmup":
         # The only purpose of the first run is to warmup the compiled model, so we can use dummy data
         train_loader.labels = torch.randint(
             0, 10, size=(len(train_loader.labels),), device=train_loader.labels.device
         )
-    total_train_steps = ceil(6 * len(train_loader))
-    whiten_bias_train_steps = ceil(3 * len(train_loader))
+    total_train_steps = ceil(epochs * len(train_loader))
+    whiten_bias_train_steps = ceil(whitening_epochs * len(train_loader))
 
     # Create optimizers and learning rate schedulers
     filter_params = [
@@ -928,6 +924,9 @@ def main(run, model, optimizer_config, batch_size=2000, wandb_run=None):
     train_images = train_loader.normalize(train_loader.images[:5000])
     model.init_whiten(train_images)
     stop_timer()
+    train_loss = None
+    train_acc = None
+    val_acc = None
 
     for epoch in range(ceil(total_train_steps / len(train_loader))):
 
@@ -939,9 +938,8 @@ def main(run, model, optimizer_config, batch_size=2000, wandb_run=None):
         model.train()
         for inputs, labels in train_loader:
             outputs = model(inputs, whiten_bias_grad=(step < whiten_bias_train_steps))
-            F.cross_entropy(
-                outputs, labels, label_smoothing=0.2, reduction="sum"
-            ).backward()
+            loss = F.cross_entropy(outputs, labels, label_smoothing=0.2, reduction="sum")
+            loss.backward()
             for group in optimizer1.param_groups[:1]:
                 group["lr"] = group["initial_lr"] * (1 - step / whiten_bias_train_steps)
             for group in optimizer1.param_groups[1:] + optimizer2.param_groups:
@@ -959,12 +957,14 @@ def main(run, model, optimizer_config, batch_size=2000, wandb_run=None):
         ####################
 
         # Save the accuracy and loss from the last training batch of the epoch
+        train_loss = loss.detach().item() / labels.size(0)
         train_acc = (outputs.detach().argmax(1) == labels).float().mean().item()
         val_acc = evaluate(model, test_loader, tta_level=0)
         print_training_details(locals(), is_final_entry=False)
         if wandb_run is not None and not is_warmup:
             wandb_run.log(
                 {
+                    "train_loss": train_loss,
                     "train_acc": train_acc,
                     "val_acc": val_acc,
                     "epoch": epoch,
@@ -990,37 +990,29 @@ def main(run, model, optimizer_config, batch_size=2000, wandb_run=None):
             }
         )
 
-    return tta_val_acc
+    return {
+        "tta_val_acc": tta_val_acc,
+        "val_acc": val_acc,
+        "train_acc": train_acc,
+        "train_loss": train_loss,
+    }
 
 
 if __name__ == "__main__":
     args = parse_args()
-
-    wandb_run = None
-    use_wandb = args.wandb or ("WANDB_SWEEP_ID" in os.environ)
-    if use_wandb:
-        try:
-            import wandb
-        except ModuleNotFoundError as exc:
-            raise ModuleNotFoundError(
-                "W&B is enabled but `wandb` is not installed. Install it with `pip install wandb`."
-            ) from exc
-        wandb_kwargs = {}
-        if args.wandb_project is not None:
-            wandb_kwargs["project"] = args.wandb_project
-        if args.wandb_entity is not None:
-            wandb_kwargs["entity"] = args.wandb_entity
-        if args.wandb_name is not None:
-            wandb_kwargs["name"] = args.wandb_name
-        if args.wandb_mode is not None:
-            wandb_kwargs["mode"] = args.wandb_mode
-        wandb_run = wandb.init(config=dict(DEFAULT_OPTIMIZER_CONFIG), **wandb_kwargs)
+    wandb_run = wandb.init(
+        project="cifar10-airbench-agent",
+        entity="thib-s",
+        mode="online",
+        name=args.run_name,
+        config=dict(DEFAULT_OPTIMIZER_CONFIG),
+    )
 
     optimizer_config = build_optimizer_config(args, wandb_run)
 
     # We re-use the compiled model between runs to save the non-data-dependent compilation time
     model = CifarNet().cuda().to(memory_format=torch.channels_last)
-    model.compile(mode="max-autotune")
+    # model.compile(mode="max-autotune")
 
     print_columns(logging_columns_list, is_head=True)
     main(
@@ -1028,27 +1020,41 @@ if __name__ == "__main__":
         model,
         optimizer_config=optimizer_config,
         batch_size=args.batch_size,
+        epochs=args.epochs,
+        whitening_epochs=args.whitening_epochs,
+        train_aug=dict(flip=not args.no_aug_flip, translate=args.aug_translate),
         wandb_run=wandb_run,
     )
-    accs = torch.tensor(
-        [
-            main(
-                run,
-                model,
-                optimizer_config=optimizer_config,
-                batch_size=args.batch_size,
-                wandb_run=wandb_run,
-            )
-            for run in range(args.num_runs)
-        ]
-    )
+    results = [
+        main(
+            run,
+            model,
+            optimizer_config=optimizer_config,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            whitening_epochs=args.whitening_epochs,
+            train_aug=dict(flip=not args.no_aug_flip, translate=args.aug_translate),
+            wandb_run=wandb_run,
+        )
+        for run in range(args.num_runs)
+    ]
+    accs = torch.tensor([result["tta_val_acc"] for result in results])
+    val_accs = torch.tensor([result["val_acc"] for result in results])
+    train_accs = torch.tensor([result["train_acc"] for result in results])
+    train_losses = torch.tensor([result["train_loss"] for result in results])
     accs_mean = accs.mean()
     accs_std = accs.std(unbiased=False)
+    val_acc_mean = val_accs.mean()
+    train_acc_mean = train_accs.mean()
+    train_loss_mean = train_losses.mean()
     print("Mean: %.4f    Std: %.4f" % (accs_mean, accs_std))
 
     if wandb_run is not None:
         wandb_run.summary["tta_val_acc_mean"] = accs_mean.item()
         wandb_run.summary["tta_val_acc_std"] = accs_std.item()
+        wandb_run.summary["val_acc_mean"] = val_acc_mean.item()
+        wandb_run.summary["train_acc_mean"] = train_acc_mean.item()
+        wandb_run.summary["train_loss_mean"] = train_loss_mean.item()
         wandb_run.summary["num_runs"] = int(args.num_runs)
 
     log_dir = os.path.join("logs", str(uuid.uuid4()))
@@ -1056,6 +1062,23 @@ if __name__ == "__main__":
     log_path = os.path.join(log_dir, "log.pt")
     torch.save(dict(code=code, accs=accs, optimizer_config=optimizer_config), log_path)
     print(os.path.abspath(log_path))
+    append_experiment_logbook(
+        path="experiment_logbook.md",
+        run_name=args.run_name,
+        num_runs=int(args.num_runs),
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        whitening_epochs=args.whitening_epochs,
+        aug_flip=not args.no_aug_flip,
+        aug_translate=args.aug_translate,
+        train_acc_mean=train_acc_mean.item(),
+        val_acc_mean=val_acc_mean.item(),
+        train_loss_mean=train_loss_mean.item(),
+        accs_mean=accs_mean.item(),
+        accs_std=accs_std.item(),
+        optimizer_config=optimizer_config,
+        log_path=log_path,
+    )
 
     if wandb_run is not None:
         wandb_run.finish()

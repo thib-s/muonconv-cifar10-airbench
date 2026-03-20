@@ -11,7 +11,6 @@ Descends from https://github.com/tysam-code/hlb-CIFAR10/blob/main/main.py
 
 import os
 import sys
-from datetime import datetime, timezone
 
 with open(sys.argv[0]) as f:
     code = f.read()
@@ -250,6 +249,7 @@ class Muon(torch.optim.Optimizer):
         lr=1e-3,
         momentum=0,
         nesterov=False,
+        weight_decay=0,
         orthogonalize_beta_init=2.0,
         orthogonalize_beta_end=0.5,
         orthogonalize_num_iters=10,
@@ -266,6 +266,7 @@ class Muon(torch.optim.Optimizer):
             lr=lr,
             momentum=momentum,
             nesterov=nesterov,
+            weight_decay=weight_decay,
             orthogonalize_beta_init=orthogonalize_beta_init,
             orthogonalize_beta_end=orthogonalize_beta_end,
             orthogonalize_num_iters=orthogonalize_num_iters,
@@ -278,19 +279,30 @@ class Muon(torch.optim.Optimizer):
         for group in self.param_groups:
             lr = group["lr"]
             momentum = group["momentum"]
+            weight_decay = group["weight_decay"] / lr
+
             for p in group["params"]:
                 g = p.grad
                 if g is None:
                     continue
+
                 state = self.state[p]
 
-                if "momentum_buffer" not in state.keys():
+                if "momentum_buffer" not in state:
                     state["momentum_buffer"] = torch.zeros_like(g)
+
                 buf = state["momentum_buffer"]
                 buf.mul_(momentum).add_(g)
                 g = g.add(buf, alpha=momentum) if group["nesterov"] else buf
 
-                p.data.mul_(len(p.data) ** 0.5 / p.data.norm())  # normalize the weight
+                # ---- Decoupled weight decay ----
+                if weight_decay != 0:
+                    p.data.mul_(1 - lr * weight_decay)
+                else:
+                    # ---- Normalize weights ----
+                    p.data.mul_(len(p.data) ** 0.5 / p.data.norm())
+
+                # ---- Orthogonalized update ----
                 if len(g.shape) == 4:
                     update = orthogonalize_kernel_beta(
                         g,
@@ -302,15 +314,17 @@ class Muon(torch.optim.Optimizer):
                     )
                     cout, cin, kh, kw = g.shape
                     update = update * sqrt(cout / cin)
-                elif (len(g.shape) == 2) or (len(g.shape) == 3):
-                    update = newton_schulz(g)  # whiten the update
+
+                elif len(g.shape) in (2, 3):
+                    update = newton_schulz(g)
                     update = update * sqrt(g.shape[-0] / update.shape[-1])
+
                 else:
                     raise NotImplementedError(
                         "Muon only supports 2D, 3D, and 4D parameters"
                     )
-                p.data.add_(update, alpha=-lr)  # take a step
 
+                p.data.add_(update, alpha=-lr)
 
 #############################################
 #                DataLoader                 #
@@ -636,7 +650,8 @@ def evaluate(model, loader, tta_level=0):
 # DEFAULT_OPTIMIZER_CONFIG = {
 #     "bias_lr": 0.053,
 #     "head_lr": 0.67,
-#     "weight_decay_scale": 1e-6,
+#     "adam_weight_decay_scale": 1e-6,
+#     "muon_weight_decay_scale": 0.0,
 #     "sgd_momentum": 0.85,
 #     "muon_lr": 0.52,
 #     "muon_momentum": 0.6,
@@ -650,7 +665,8 @@ def evaluate(model, loader, tta_level=0):
 DEFAULT_OPTIMIZER_CONFIG = {
     "bias_lr": 0.053,
     "head_lr": 0.67,
-    "weight_decay_scale": 1e-6,
+    "adam_weight_decay_scale": 2e-6,
+    "muon_weight_decay_scale": 0.0,
     "sgd_momentum": 0.85,
     "muon_lr": 0.52,
     "muon_momentum": 0.6,
@@ -711,10 +727,22 @@ def parse_args():
         help="Learning rate for classification head.",
     )
     parser.add_argument(
-        "--weight-decay-scale",
+        "--adam-weight-decay-scale",
         type=float,
         default=None,
-        help="Scale so actual weight decay is weight_decay_scale * batch_size.",
+        help=(
+            "Scale for the non-Muon optimizer groups so actual weight decay is "
+            "adam_weight_decay_scale * batch_size."
+        ),
+    )
+    parser.add_argument(
+        "--muon-weight-decay-scale",
+        type=float,
+        default=None,
+        help=(
+            "Scale for Muon groups so actual weight decay is "
+            "muon_weight_decay_scale * batch_size."
+        ),
     )
     parser.add_argument(
         "--sgd-momentum",
@@ -763,10 +791,17 @@ def parse_args():
 
 def build_optimizer_config(args, wandb_run):
     optimizer_config = dict(DEFAULT_OPTIMIZER_CONFIG)
+
+    if wandb_run is not None:
+        for key in optimizer_config:
+            if key in wandb_run.config:
+                optimizer_config[key] = wandb_run.config[key]
+
     cli_overrides = {
         "bias_lr": args.bias_lr,
         "head_lr": args.head_lr,
-        "weight_decay_scale": args.weight_decay_scale,
+        "adam_weight_decay_scale": args.adam_weight_decay_scale,
+        "muon_weight_decay_scale": args.muon_weight_decay_scale,
         "sgd_momentum": args.sgd_momentum,
         "muon_lr": args.muon_lr,
         "muon_momentum": args.muon_momentum,
@@ -781,9 +816,6 @@ def build_optimizer_config(args, wandb_run):
             optimizer_config[key] = value
 
     if wandb_run is not None:
-        for key in optimizer_config:
-            if key in wandb_run.config:
-                optimizer_config[key] = wandb_run.config[key]
         wandb_run.config.update(optimizer_config, allow_val_change=True)
 
     optimizer_config["orthogonalize_num_iters"] = int(
@@ -795,8 +827,7 @@ def build_optimizer_config(args, wandb_run):
     return optimizer_config
 
 
-def append_experiment_logbook(
-    path,
+def print_experiment_summary(
     run_name,
     num_runs,
     batch_size,
@@ -812,32 +843,22 @@ def append_experiment_logbook(
     optimizer_config,
     log_path,
 ):
-    timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-    lines = [
-        f"## {timestamp} - {run_name}",
-        f"- mean_tta_val_acc: {accs_mean:.4f}",
-        f"- std_tta_val_acc: {accs_std:.4f}",
-        f"- mean_val_acc: {val_acc_mean:.4f}",
-        f"- mean_train_acc: {train_acc_mean:.4f}",
-        f"- mean_train_loss: {train_loss_mean:.4f}",
-        f"- num_runs: {num_runs}",
-        f"- batch_size: {batch_size}",
-        f"- epochs: {epochs}",
-        f"- whitening_epochs: {whitening_epochs}",
-        f"- aug_flip: {aug_flip}",
-        f"- aug_translate: {aug_translate}",
-        f"- log_path: {os.path.abspath(log_path)}",
-        "",
-        "### Optimizer Config",
-        "```python",
-        repr(optimizer_config),
-        "```",
-        "",
-    ]
-    with open(path, "a", encoding="utf-8") as f:
-        if f.tell() > 0:
-            f.write("\n")
-        f.write("\n".join(lines))
+    print("Experiment summary:")
+    print(f"  run_name: {run_name}")
+    print(f"  mean_tta_val_acc: {accs_mean:.4f}")
+    print(f"  std_tta_val_acc: {accs_std:.4f}")
+    print(f"  mean_val_acc: {val_acc_mean:.4f}")
+    print(f"  mean_train_acc: {train_acc_mean:.4f}")
+    print(f"  mean_train_loss: {train_loss_mean:.4f}")
+    print(f"  num_runs: {num_runs}")
+    print(f"  batch_size: {batch_size}")
+    print(f"  epochs: {epochs}")
+    print(f"  whitening_epochs: {whitening_epochs}")
+    print(f"  aug_flip: {aug_flip}")
+    print(f"  aug_translate: {aug_translate}")
+    print(f"  log_path: {os.path.abspath(log_path)}")
+    print("  optimizer_config:")
+    print(f"    {repr(optimizer_config)}")
 
 
 def main(
@@ -854,7 +875,8 @@ def main(
     is_warmup = run == "warmup"
     bias_lr = optimizer_config["bias_lr"]
     head_lr = optimizer_config["head_lr"]
-    wd = optimizer_config["weight_decay_scale"] * batch_size
+    adam_wd = optimizer_config["adam_weight_decay_scale"] * batch_size
+    muon_wd = optimizer_config["muon_weight_decay_scale"] * batch_size
 
     test_loader = CifarLoader("cifar10", train=False, batch_size=2000)
     train_loader = CifarLoader(
@@ -876,9 +898,9 @@ def main(
         p for n, p in model.named_parameters() if "norm" in n and p.requires_grad
     ]
     param_configs = [
-        dict(params=[model.whiten.bias], lr=bias_lr, weight_decay=wd / bias_lr),
-        dict(params=norm_biases, lr=bias_lr, weight_decay=wd / bias_lr),
-        dict(params=[model.head.weight], lr=head_lr, weight_decay=wd / head_lr),
+        dict(params=[model.whiten.bias], lr=bias_lr, weight_decay=adam_wd / bias_lr),
+        dict(params=norm_biases, lr=bias_lr, weight_decay=adam_wd / bias_lr),
+        dict(params=[model.head.weight], lr=head_lr, weight_decay=adam_wd / head_lr),
     ]
     optimizer1 = torch.optim.SGD(
         param_configs,
@@ -891,6 +913,7 @@ def main(
         lr=optimizer_config["muon_lr"],
         momentum=optimizer_config["muon_momentum"],
         nesterov=True,
+        weight_decay=muon_wd,
         orthogonalize_beta_init=optimizer_config["orthogonalize_beta_init"],
         orthogonalize_beta_end=optimizer_config["orthogonalize_beta_end"],
         orthogonalize_num_iters=optimizer_config["orthogonalize_num_iters"],
@@ -1062,8 +1085,7 @@ if __name__ == "__main__":
     log_path = os.path.join(log_dir, "log.pt")
     torch.save(dict(code=code, accs=accs, optimizer_config=optimizer_config), log_path)
     print(os.path.abspath(log_path))
-    append_experiment_logbook(
-        path="experiment_logbook.md",
+    print_experiment_summary(
         run_name=args.run_name,
         num_runs=int(args.num_runs),
         batch_size=args.batch_size,

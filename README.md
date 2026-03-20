@@ -14,11 +14,18 @@ A convolution is not just a small kernel tensor. It is a linear operator acting 
 
 The video [assets/ConvolutionToToeplitz.mp4](assets/ConvolutionToToeplitz.mp4) illustrates this viewpoint.
 
+<video src="assets/ConvolutionToToeplitz.mp4" controls muted loop width="720">
+  Your browser does not support embedded video. Open
+  <a href="assets/ConvolutionToToeplitz.mp4">ConvolutionToToeplitz.mp4</a>.
+</video>
+
 ### 2. The current procedure does not produce orthonormal convolution updates
 
 If we reshape a convolution kernel into a dense matrix, apply Newton-Schulz, and reshape back, the resulting kernel is generally **not** the polar factor of the true convolution operator.
 
 This discrepancy is illustrated in [assets/problem_framing.png](assets/problem_framing.png) and explored in detail in [walkthrough.ipynb](walkthrough.ipynb).
+
+![Problem framing](assets/problem_framing.png)
 
 In other words:
 

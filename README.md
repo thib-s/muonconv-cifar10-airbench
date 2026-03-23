@@ -1,4 +1,4 @@
-# muon_conv2
+# When applied to convolutions, Muon is not Muon
 
 This repository investigates a specific mismatch between Muon theory and its practical use on convolutional layers.
 
@@ -12,12 +12,9 @@ The notebook [walkthrough.ipynb](walkthrough.ipynb) is the main explanation. It 
 
 A convolution is not just a small kernel tensor. It is a linear operator acting on images, and can be represented as a large structured matrix with Toeplitz / block-circulant structure.
 
-The video [assets/ConvolutionToToeplitz.mp4](assets/ConvolutionToToeplitz.mp4) illustrates this viewpoint.
+This video illustrates this viewpoint. 
 
-<video src="assets/ConvolutionToToeplitz.mp4" controls muted loop width="720">
-  Your browser does not support embedded video. Open
-  <a href="assets/ConvolutionToToeplitz.mp4">ConvolutionToToeplitz.mp4</a>.
-</video>
+[ConvolutionToToeplitz](https://github.com/user-attachments/assets/aeb91805-b90a-430e-b392-c2b68d0bef85)
 
 ### 2. The current procedure does not produce orthonormal convolution updates
 
@@ -39,7 +36,7 @@ Several convolution-friendly Muon variants exist, but this repo argues that they
 
 ## Section 2: our approach
 
-Our approach is to reimplement the order-3 Newton-Schulz-style update directly in the convolutional domain, in a way that is exactly equivalent to applying Newton-Schulz to the associated Toeplitz / block-circulant operator.
+Our approach is to rewrite the order-3 Newton-Schulz-style update directly in the convolutional domain. In a way that is exactly equivalent to applying Newton-Schulz to the associated Toeplitz / block-circulant operator coupled with a projection over fixed size kernels.
 
 The practical idea is:
 
@@ -54,11 +51,13 @@ This gives an alternating-projection style procedure:
 
 The implementation lives in [airbench94_conv_muon.py](airbench94_conv_muon.py), mainly through `orthogonalize_kernel_beta(...)`.
 
+![ProjectionAlgorithm_ManimCE_v0 19 1](https://github.com/user-attachments/assets/a2a13d50-1891-4cfd-b1cc-97b0b4ace86f)
+
 ## Section 3: bug or feature?
 
 At the moment, it is hard to draw strong empirical conclusions.
 
-The current CIFAR-10 speedrun setup was tuned for the older approximation, and some prior comparisons use a biased baseline around `91%`. In this repo, the current tuned configuration reaches about `93.95%`, which is competitive but not decisive.
+The current CIFAR-10 speedrun setup was tuned for the older approximation, and some prior comparisons use a biased baseline around `91%`. In this repo, the current tuned configuration reaches about `93.9%`, which is competitive but not decisive.
 
 The main caveat is that this regime appears heavily limited by overfitting:
 
@@ -107,6 +106,17 @@ The main result so far is conceptual:
 
 - flattening a convolution kernel and orthogonalizing it is not the same as orthogonalizing the convolution operator,
 - this difference can be made explicit on small tractable examples,
-- a convolution-domain orthogonalization procedure can be implemented efficiently enough to test in practice.
+- a convolution-domain orthogonalization procedure can be implemented efficiently an yield competitive results.
 
 The open question is whether this more faithful construction improves learning once the entire training recipe is retuned for it.
+
+
+## Citation
+```
+@misc{lin2025flash,
+  author       = {Thibaut Boissin},
+  title        = {Muon is not Muon when applied to convolutions},
+  year         = {2026},
+  url          = {https://github.com/thib-s/muonconv-cifar10-airbench}
+}
+```

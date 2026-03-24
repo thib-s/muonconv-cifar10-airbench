@@ -672,9 +672,9 @@ DEFAULT_OPTIMIZER_CONFIG = {
     "muon_momentum": 0.6,
     "orthogonalize_beta_init": 0.5,
     "orthogonalize_beta_end": 0.5,
-    "orthogonalize_num_iters": 12,
+    "orthogonalize_num_iters": 10,
     "orthogonalize_damp": 0.91,
-    "orthogonalize_epsilon": 0.1,
+    "orthogonalize_epsilon": 0.09,
 }
 
 

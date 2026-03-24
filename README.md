@@ -1,4 +1,4 @@
-# When applied to convolutions, Muon is not Muon
+# Muon is not Muon when applied to convolutions
 
 This repository investigates a specific mismatch between Muon theory and its practical use on convolutional layers.
 
@@ -57,26 +57,16 @@ The implementation lives in [airbench94_conv_muon.py](airbench94_conv_muon.py), 
 
 At the moment, it is hard to draw strong empirical conclusions.
 
-The current CIFAR-10 speedrun setup was tuned for the older approximation, and some prior comparisons use a biased baseline around `91%`. In this repo, the current tuned configuration reaches about `93.9%`, which is competitive but not decisive.
+I have noticed that some prior comparisons use a modified baseline reaching around `91%`. While this protocol ensures a repeatable setup, I do prefer a comparison against the original baseline by @KellerJordan which obtains `94%`, and performs multiple runs to compute mean/std. In this repo, the current tuned configuration reaches about `93.98%`, which is competitive but not decisive.
 
 The main caveat is that this regime appears heavily limited by overfitting:
 
-- a faster optimizer may simply overfit faster,
-- better optimization does not automatically translate into better final accuracy,
-- optimizer comparisons are hard to interpret when the training recipe itself is not retuned.
+- a faster optimizer may simply overfit faster (note that our implementation reaches `93.64` when we reduce to only 7 epochs)
+- better optimization does not automatically translate into better final accuracy
 
 So the current answer is: maybe bug, maybe feature, but not enough evidence yet.
 
 More experiments are needed to determine whether the gap between theory and practice is merely harmless approximation, or whether it hides a real optimization issue for convolutional Muon.
-
-## Repository contents
-
-- [walkthrough.ipynb](walkthrough.ipynb): conceptual walkthrough of the discrepancy and the proposed convolutional orthogonalization.
-- [airbench94_conv_muon.py](airbench94_conv_muon.py): CIFAR-10 training script with the convolutional Muon variant.
-- [experiment_logbook.md](experiment_logbook.md): experiment history and observed validation accuracy.
-- [user_thoughts_and directions.md](user_thoughts_and%20directions.md): working hypotheses and research notes.
-- [assets/ConvolutionToToeplitz.mp4](assets/ConvolutionToToeplitz.mp4): visualization of convolution as a linear operator.
-- [assets/problem_framing.png](assets/problem_framing.png): summary image of the mismatch.
 
 ## Running the code
 
@@ -98,7 +88,7 @@ Useful knobs exposed by the training script include:
 
 The script will download CIFAR-10 automatically if needed and logs runs through Weights & Biases.
 
-The current default train a model that reaches around 94% validation accuracy:
+The current default train a model that reaches around 94% validation accuracy (see the `run_log.txt`), in a competitive runtime (here without compilation)
 
 ```
 ---------------------------------------------------------------------------------
@@ -143,16 +133,11 @@ Mean: 0.9398    Std: 0.0009
 
 ## Current status
 
-This repo should be read as an investigation, not as a finished optimizer package.
-
 The main result so far is conceptual:
 
 - flattening a convolution kernel and orthogonalizing it is not the same as orthogonalizing the convolution operator,
 - this difference can be made explicit on small tractable examples,
 - a convolution-domain orthogonalization procedure can be implemented efficiently an yield competitive results.
-
-The open question is whether this more faithful construction improves learning once the entire training recipe is retuned for it.
-
 
 ## Citation
 ```

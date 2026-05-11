@@ -36,54 +36,6 @@ import torch
 import torch.nn.functional as F
 
 
-def compute_delattre2023(X, n=None, n_iter=3):
-    """Estimate spectral norm of convolutional layer with Delattre2023.
-
-    From a convolutional filter, this function estimates the spectral norm of
-    the convolutional layer for circular padding using [Section.3, Algo. 3] Delattre2023.
-
-    Parameters
-    ----------
-    X : ndarray, shape (cout, cint, k, k)
-        Convolutional filter.
-    n : None | int, default=None
-        Size of input image. If None, n is set equal to k.
-    n_iter : int, default=4
-        Number of iterations.
-    return_time : bool, default True
-        Return computational time.
-
-    Returns
-    -------
-    sigma : float
-        Largest singular value.
-    time : float
-        If `return_time` is True, it returns the computational time.
-    """
-    cout, cin, k, _ = X.shape
-    if n is None:
-        n = k
-    if cin > cout:
-        X = X.transpose(0, 1)
-        cin, cout = cout, cin
-
-    crossed_term = torch.fft.rfft2(X, s=(n, n)).reshape(cout, cin, -1).permute(2, 0, 1)
-    inverse_power = 1
-    log_curr_norm = torch.zeros(crossed_term.shape[0]).to(crossed_term.device)
-    for _ in range(n_iter):
-        norm_crossed_term = crossed_term.norm(dim=(1, 2))
-        crossed_term /= norm_crossed_term.reshape(-1, 1, 1)
-        log_curr_norm = 2 * log_curr_norm + norm_crossed_term.log()
-        crossed_term = torch.bmm(crossed_term.conj().transpose(1, 2), crossed_term)
-        inverse_power /= 2
-    sigma = (
-        crossed_term.norm(dim=(1, 2)).pow(inverse_power)
-        * ((2 * inverse_power * log_curr_norm).exp())
-    ).max()
-
-    return sigma
-
-
 def compute_spectral_rescaling_conv(kernel, n_iter=1):
     if n_iter < 1:
         raise ValueError(f"n_iter must be at least equal to 1, got {n_iter}")
@@ -147,15 +99,10 @@ def orthogonalize_kernel_beta(
     # x_pad = F.pad(x, (pw, pw, ph, ph))
     # v = F.conv2d(x_pad, w, bias=None, stride=1, padding=0)  # [ci, ci, 2kh-1, 2kw-1]
 
-    # # Sum abs over channel+spatial, then compute inverse sqrt
-    # lipschitz_bounds_sq = v.abs().sum(dim=(1, 2, 3))        # [ci]
-    # rescale = (lipschitz_bounds_sq + epsilon).pow(-0.5)     # [ci]
-    # ker = ker * rescale.view(1, -1, 1, 1)
-    ## AOL tested: not good
     ## frobenius much better
     # ker = ker / (torch.sqrt(torch.sum(torch.square(ker))) + epsilon) # global rescale to ensure stability of bjorck algorithm, and to keep the scale of the updates consistent across different random initializations
     ## spectral give current best results
-    ker = ker / (compute_spectral_rescaling_conv(ker, n_iter=1).max() + epsilon)
+    ker = ker / (compute_spectral_rescaling_conv(ker, n_iter=3).max() + epsilon)
     ## RKO might be worth to try
     # ker = newton_schulz(ker.reshape(co, -1)).reshape_as(ker) / sqrt(kw + kh) # orthogonalize the kernel to improve conditioning of the bjorck algorithm
 
@@ -683,7 +630,7 @@ def parse_args():
         description="Train CIFAR10 Airbench with W&B logging and sweep-configurable optimizer hyperparameters."
     )
     parser.add_argument(
-        "--num-runs", type=int, default=5, help="Number of measured runs after warmup."
+        "--num-runs", type=int, default=10, help="Number of measured runs after warmup."
     )
     parser.add_argument(
         "--batch-size", type=int, default=2000, help="Training batch size."
@@ -691,8 +638,20 @@ def parse_args():
     parser.add_argument(
         "--run-name",
         type=str,
-        required=True,
-        help="W&B run name.",
+        default=None,
+        help="Optional W&B run name.",
+    )
+    parser.add_argument(
+        "--sweep-id",
+        type=str,
+        default=None,
+        help="Optional W&B sweep ID. When provided, this script runs a sweep agent.",
+    )
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=None,
+        help="Max number of runs for this sweep agent.",
     )
     parser.add_argument(
         "--epochs", type=float, default=8, help="Total number of training epochs."
@@ -836,7 +795,9 @@ def print_experiment_summary(
     aug_flip,
     aug_translate,
     train_acc_mean,
+    train_acc_std,
     val_acc_mean,
+    val_acc_std,
     train_loss_mean,
     accs_mean,
     accs_std,
@@ -848,7 +809,9 @@ def print_experiment_summary(
     print(f"  mean_tta_val_acc: {accs_mean:.4f}")
     print(f"  std_tta_val_acc: {accs_std:.4f}")
     print(f"  mean_val_acc: {val_acc_mean:.4f}")
+    print(f"  std_val_acc: {val_acc_std:.4f}")
     print(f"  mean_train_acc: {train_acc_mean:.4f}")
+    print(f"  std_train_acc: {train_acc_std:.4f}")
     print(f"  mean_train_loss: {train_loss_mean:.4f}")
     print(f"  num_runs: {num_runs}")
     print(f"  batch_size: {batch_size}")
@@ -1021,16 +984,7 @@ def main(
     }
 
 
-if __name__ == "__main__":
-    args = parse_args()
-    wandb_run = wandb.init(
-        project="cifar10-airbench-agent",
-        entity="thib-s",
-        mode="online",
-        name=args.run_name,
-        config=dict(DEFAULT_OPTIMIZER_CONFIG),
-    )
-
+def run_training(args, wandb_run):
     optimizer_config = build_optimizer_config(args, wandb_run)
 
     # We re-use the compiled model between runs to save the non-data-dependent compilation time
@@ -1038,16 +992,16 @@ if __name__ == "__main__":
     # model.compile(mode="max-autotune")
 
     print_columns(logging_columns_list, is_head=True)
-    main(
-        "warmup",
-        model,
-        optimizer_config=optimizer_config,
-        batch_size=args.batch_size,
-        epochs=args.epochs,
-        whitening_epochs=args.whitening_epochs,
-        train_aug=dict(flip=not args.no_aug_flip, translate=args.aug_translate),
-        wandb_run=wandb_run,
-    )
+    # main(
+    #     "warmup",
+    #     model,
+    #     optimizer_config=optimizer_config,
+    #     batch_size=args.batch_size,
+    #     epochs=args.epochs,
+    #     whitening_epochs=args.whitening_epochs,
+    #     train_aug=dict(flip=not args.no_aug_flip, translate=args.aug_translate),
+    #     wandb_run=wandb_run,
+    # )
     results = [
         main(
             run,
@@ -1068,17 +1022,25 @@ if __name__ == "__main__":
     accs_mean = accs.mean()
     accs_std = accs.std(unbiased=False)
     val_acc_mean = val_accs.mean()
+    val_acc_std = val_accs.std(unbiased=False)
     train_acc_mean = train_accs.mean()
+    train_acc_std = train_accs.std(unbiased=False)
     train_loss_mean = train_losses.mean()
     print("Mean: %.4f    Std: %.4f" % (accs_mean, accs_std))
+    final_metrics = {
+        "tta_val_acc_mean": accs_mean.item(),
+        "tta_val_acc_std": accs_std.item(),
+        "val_acc_mean": val_acc_mean.item(),
+        "val_acc_std": val_acc_std.item(),
+        "train_acc_mean": train_acc_mean.item(),
+        "train_acc_std": train_acc_std.item(),
+        "train_loss_mean": train_loss_mean.item(),
+        "num_runs": int(args.num_runs),
+    }
 
     if wandb_run is not None:
-        wandb_run.summary["tta_val_acc_mean"] = accs_mean.item()
-        wandb_run.summary["tta_val_acc_std"] = accs_std.item()
-        wandb_run.summary["val_acc_mean"] = val_acc_mean.item()
-        wandb_run.summary["train_acc_mean"] = train_acc_mean.item()
-        wandb_run.summary["train_loss_mean"] = train_loss_mean.item()
-        wandb_run.summary["num_runs"] = int(args.num_runs)
+        for key, value in final_metrics.items():
+            wandb_run.summary[key] = value
 
     log_dir = os.path.join("logs", str(uuid.uuid4()))
     os.makedirs(log_dir, exist_ok=True)
@@ -1086,7 +1048,7 @@ if __name__ == "__main__":
     torch.save(dict(code=code, accs=accs, optimizer_config=optimizer_config), log_path)
     print(os.path.abspath(log_path))
     print_experiment_summary(
-        run_name=args.run_name,
+        run_name=(wandb_run.name if wandb_run is not None else args.run_name),
         num_runs=int(args.num_runs),
         batch_size=args.batch_size,
         epochs=args.epochs,
@@ -1094,7 +1056,9 @@ if __name__ == "__main__":
         aug_flip=not args.no_aug_flip,
         aug_translate=args.aug_translate,
         train_acc_mean=train_acc_mean.item(),
+        train_acc_std=train_acc_std.item(),
         val_acc_mean=val_acc_mean.item(),
+        val_acc_std=val_acc_std.item(),
         train_loss_mean=train_loss_mean.item(),
         accs_mean=accs_mean.item(),
         accs_std=accs_std.item(),
@@ -1104,3 +1068,39 @@ if __name__ == "__main__":
 
     if wandb_run is not None:
         wandb_run.finish()
+
+
+def run_standalone(args):
+    wandb_run = wandb.init(
+        project="cifar10-airbench-1ep-sweeps",
+        entity="thib-s",
+        mode="online",
+        name=args.run_name,
+        config=dict(DEFAULT_OPTIMIZER_CONFIG),
+    )
+    run_training(args, wandb_run)
+
+
+def run_sweep_trial(args):
+    wandb_run = wandb.init(
+        name=args.run_name,
+        config=dict(DEFAULT_OPTIMIZER_CONFIG),
+    )
+    run_training(args, wandb_run)
+
+
+def run_sweep_agent(args):
+    wandb.agent(
+        args.sweep_id,
+        project="cifar10-airbench-1ep-sweeps",
+        function=lambda: run_sweep_trial(args),
+        count=args.count,
+    )
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    if args.sweep_id:
+        run_sweep_agent(args)
+    else:
+        run_standalone(args)
